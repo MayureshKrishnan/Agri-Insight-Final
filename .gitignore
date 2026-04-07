@@ -1,0 +1,15 @@
+# Data and heavy files
+ai-engine/data/
+*.h5
+*.pkl
+
+# Environments and Node
+tf_gpu_env/
+node_modules/
+
+# Credentials and IDE
+.env
+__pycache__/
+.idea/
+.vscode/
+desktop.ini

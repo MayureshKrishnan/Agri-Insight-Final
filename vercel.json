@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/ai-engine/api.py" }
+  ],
+  "functions": {
+    "ai-engine/api.py": { "runtime": "vercel-python@0.0.6" }
+  }
+}
