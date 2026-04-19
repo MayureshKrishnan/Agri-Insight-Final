@@ -1,8 +1,17 @@
 {
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/ai-engine/api.py" }
+  "version": 2,
+  "builds": [
+    {
+      "src": "web-assistant/package.json",
+      "use": "@vercel/static-build"
+    },
+    {
+      "src": "ai-engine/api/index.py",
+      "use": "@vercel/python"
+    }
   ],
-  "functions": {
-    "ai-engine/api.py": { "runtime": "vercel-python@0.0.6" }
-  }
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "ai-engine/api/index.py" },
+    { "source": "/(.*)", "destination": "web-assistant/$1" }
+  ]
 }

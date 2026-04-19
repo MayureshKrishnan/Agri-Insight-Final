@@ -1,6 +1,8 @@
 import os
 import joblib
 import uvicorn
+import numpy as np
+import pandas as pd  
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -11,7 +13,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 app = FastAPI(title="Agri-Insight Master AI")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "Agri-Insight API is running on Port 8001"}
+
+# CORS CONFIGURATION: Optimized for Local and Production
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=[
+        "http://localhost:5173", 
+        "http://127.0.0.1:5173", 
+        "https://agri-insight-final.vercel.app"
+    ], 
+    allow_methods=["*"], 
+    allow_headers=["*"],
+)
 
 # --- 2. LOAD MODELS ---
 try:
@@ -20,57 +37,71 @@ try:
     yield_encoders = joblib.load(os.path.join(MODELS_DIR, "yield_encoders.pkl"))
     print("✅ All Engines Online: Local Models Loaded Successfully.")
 except Exception as e:
-    print(f"❌ CRITICAL ERROR: Could not load models. Did you run the trainers? {e}")
+    print(f"❌ CRITICAL ERROR: Could not load models. Ensure .pkl files are in /models folder. {e}")
 
-# Gemini Vision Config
-client = genai.Client(api_key="AIzaSyDkijjKakSz8in8mBUBWTfY1d-vbNM6Mok")
+# --- GEMINI CLIENT ---
+# Uses 'gemini-1.5-flash-latest' to resolve v1beta 404 versioning errors
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDkijjKakSz8in8mBUBWTfY1d-vbNM6Mok")
+client = genai.Client(api_key=GEMINI_KEY)
 
-# --- 3. ENDPOINT: CROP RECOMMENDATION (The Sync Fix) ---
+# --- 3. ENDPOINT: CROP RECOMMENDATION (With Inference Guard) ---
 @app.get("/recommend")
 async def recommend(
     n: float, p: float, k: float, ph: float,
-    temp: float = Query(25.0), 
-    humid: float = Query(80.0), 
-    rain: float = Query(200.0)
+    temp: float = Query(30.0),   # Synced with Mumbai/Kharghar averages
+    humid: float = Query(85.0),  # Synced with Coastal Humidity
+    rain: float = Query(180.0)   # Synced with Seasonal Rainfall
 ):
     try:
-        # DATA SENSE-CHECK: 
-        # If Potassium (k) > 100, the model thinks it's Grapes/Apple.
-        # If Rain < 150, the model thinks it's Coffee/Maize.
+        # --- DATA INTEGRITY CHECK (INFERENCE GUARD) ---
+        # This adds a validation layer before the ML model processes the data.
+        warnings = []
+        if k > 120:
+            warnings.append("High Potassium (K) outlier detected. Potential data distribution mismatch.")
+        if ph < 4.5 or ph > 8.5:
+            warnings.append("pH level is outside standard arable ranges (4.5 - 8.5).")
+        if n > 140:
+            warnings.append("High Nitrogen detected. Resulting predictions may be skewed.")
+
+        # FIXED: Explicit feature mapping using Pandas DataFrame
+        feature_names = ['N', 'P', 'K', 'temperature', 'humidity', 'ph', 'rainfall']
+        input_df = pd.DataFrame([[n, p, k, temp, humid, ph, rain]], columns=feature_names)
         
-        # STRICT FEATURE ORDER: [N, P, K, temp, humid, ph, rain]
-        input_data = [[n, p, k, temp, humid, ph, rain]]
-        
-        probs = crop_model.predict_proba(input_data)[0]
+        print(f"DEBUG: Processing Inference -> N:{n}, P:{p}, K:{k}, pH:{ph} | Temp:{temp}")
+        if warnings:
+            print(f"⚠️ GUARD WARNINGS: {warnings}")
+
+        # Execute Prediction
+        probs = crop_model.predict_proba(input_df)[0]
         classes = crop_model.classes_
         
-        # Sort DESCENDING (Highest probability first)
+        # Sort by confidence descending
         results = sorted(zip(classes, probs), key=lambda x: x[1], reverse=True)
         
         return {
             "status": "success",
+            "integrity_notes": warnings if warnings else "Data within valid distribution",
             "recommendations": [
                 {"name": str(c).capitalize(), "confidence": f"{round(pr*100, 1)}%"} 
                 for c, pr in results[:3]
             ]
         }
     except Exception as e:
-        return {"status": "error", "message": f"Logic Error: {str(e)}"}
+        print(f"ERROR: {e}")
+        return {"status": "error", "message": f"Inference Error: {str(e)}"}
 
-# --- 4. ENDPOINT: YIELD PREDICTION (The Location Fix) ---
+# --- 4. ENDPOINT: YIELD PREDICTION ---
 @app.get("/predict_yield")
 async def predict_yield(state: str, district: str, crop: str, season: str, area: float):
     try:
-        # Standardize strings to match 'India Agriculture Crop Production.csv'
         s, d, c, se = state.strip().title(), district.strip().upper(), crop.strip().title(), season.strip().title()
         
-        # Encode inputs
         s_idx = yield_encoders['State'].transform([s])[0]
         d_idx = yield_encoders['District'].transform([d])[0]
         c_idx = yield_encoders['Crop'].transform([c])[0]
         se_idx = yield_encoders['Season'].transform([se])[0]
         
-        # Predict using Deep Forest
+        # Applying model prediction
         prediction = yield_model.predict([[s_idx, d_idx, c_idx, se_idx, area]])
         
         return {
@@ -80,18 +111,21 @@ async def predict_yield(state: str, district: str, crop: str, season: str, area:
             "location": f"{d}, {s}"
         }
     except Exception as e:
-        return {"status": "error", "message": f"Label Mismatch: {str(e)}. Tip: Use 'MUMBAI' and 'Maharashtra'."}
+        return {"status": "error", "message": f"Label Mismatch: {str(e)}"}
 
 # --- 5. ENDPOINT: DISEASE SCANNER ---
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     try:
         img_content = await file.read()
+        
+        # Gemini Vision Inference
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-1.5-flash-latest",
             contents=[
-                "Act as an Indian agronomist. Identify the plant disease. "
-                "Output: 1. Disease Name, 2. Symptoms, 3. Organic Cure, 4. Chemical Cure.",
+                "Act as an Indian agronomist. Identify the plant disease from this image. "
+                "Output: 1. Disease Name, 2. Symptoms, 3. Organic Cure, 4. Chemical Cure. "
+                "Keep response clear and professional for a report.",
                 types.Part.from_bytes(data=img_content, mime_type="image/jpeg")
             ]
         )
